@@ -1,0 +1,290 @@
+#define BLYNK_TEMPLATE_ID "TMPL3yp8XmuNh"
+#define BLYNK_TEMPLATE_NAME "SMART SAFETY SYSTEM"
+#define BLYNK_AUTH_TOKEN "7vbCH2cM5PZZzLH_5ojqyQVH22zdUBec"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h> 
+#include <Adafruit_Sensor.h>
+#include <DHT.h>              
+#include <ESP32Servo.h>       
+#include <LiquidCrystal_I2C.h> 
+
+// --- NETWORK CONFIGURATION ---
+char auth[] = BLYNK_AUTH_TOKEN;
+char ssid[] = "Wokwi-GUEST"; 
+char pass[] = "";
+
+// --- HARDWARE PIN CONFIGURATION ---
+#define DHTPIN 15           
+#define DHTTYPE DHT22
+#define GAS_ANALOG_PIN 34   
+#define PULSE_ANALOG_PIN 35  
+#define BUZZER_PIN 13       
+#define RED_LED 12          
+#define YELLOW_LED 26       
+#define GREEN_LED 25        
+#define LEFT_SERVO_PIN 14   
+#define RIGHT_SERVO_PIN 27  
+
+// --- INSTANTIATE OBJECTS ---
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_MPU6050 mpu;
+Servo leftVibeServo;
+Servo rightVibeServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// --- EDGE AI & SECURITY THRESHOLDS ---
+const float TEMP_FIRE_THRESHOLD = 50.0;  
+const int GAS_DANGER_THRESHOLD = 450;    
+const int PULSE_MIN_LIMIT = 55;          
+const int PULSE_MAX_LIMIT = 140;         
+const float FALL_IMPACT_G = 2.5;         
+
+// --- SYSTEM CONTROLLERS ---
+int workerID = 101;                      
+unsigned long lastNotificationTime = 0;
+const unsigned long notificationInterval = 60000; // 1 Minute matching your Blynk console
+unsigned long lastLcdUpdateTime = 0;
+unsigned long lastBlynkDataTime = 0; // Global data transmission throttle
+bool displayToggle = false;
+bool wasInDangerBefore = false; 
+
+void setup() {
+  Serial.begin(115200);
+  
+  // LCD Initialize
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print(" SMART HELMET ");
+  lcd.setCursor(0, 1);
+  lcd.print(" INITIALIZING...");
+
+  // Pin modes setup
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+
+  noTone(BUZZER_PIN); 
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(YELLOW_LED, LOW);
+  digitalWrite(GREEN_LED, HIGH); 
+
+  leftVibeServo.attach(LEFT_SERVO_PIN);
+  rightVibeServo.attach(RIGHT_SERVO_PIN);
+  leftVibeServo.write(0);  
+  rightVibeServo.write(0); 
+
+  dht.begin();
+  mpu.begin(); 
+
+  // Connect to Blynk
+  Blynk.begin(auth, ssid, pass);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SYSTEM ONLINE");
+  lcd.setCursor(0, 1);
+  lcd.print("WORKER ID: 101");
+  delay(1000);
+}
+
+void loop() {
+  if (Blynk.connected()) {
+    Blynk.run();
+  }
+  processEdgeAIAndRouting();
+  delay(200); 
+}
+
+void processEdgeAIAndRouting() {
+  float temperature = dht.readTemperature();
+  int gasPpm = map(analogRead(GAS_ANALOG_PIN), 0, 4095, 0, 1000);
+  int pulseBpm = map(analogRead(PULSE_ANALOG_PIN), 0, 4095, 40, 180);
+
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  float netAcceleration = sqrt(pow(a.acceleration.x, 2) + pow(a.acceleration.y, 2) + pow(a.acceleration.z, 2)) / 9.81;
+
+  // --- VARIABLES FOR MATRIX SYSTEM ---
+  String statusFlag = "SAFE";
+  bool isSystemInDanger = false;
+  String routingDirection = "NONE";
+  bool warningFlag = false;
+  String lcdLine1 = "";
+  String lcdLine2 = "";
+  
+  const char* blynkAlertMsg = "HELMET EMERGENCY!"; 
+
+  // ==========================================================================
+  // --- EXHAUSTIVE 8-STAGE EDGE AI THREAT DETECTION MATRIX ---
+  // ==========================================================================
+
+  // PATTERN 1: MAXIMUM TRIPLE THREAT
+  if (temperature > TEMP_FIRE_THRESHOLD && gasPpm > GAS_DANGER_THRESHOLD && pulseBpm > PULSE_MAX_LIMIT) {
+    statusFlag = "FIRE_TRAP";
+    isSystemInDanger = true;
+    routingDirection = "ESCAPE_LEFT"; 
+    lcdLine1 = "CRITICAL TRAP!";
+    lcdLine2 = "EVACUATE LEFT <--";
+    blynkAlertMsg = "CRITICAL FIRE TRAP DETECTED!";
+  }
+  // PATTERN 2: DUAL ENVIRONMENTAL HAZARD (Bina pulse high huye alert bajega)
+  else if (temperature > TEMP_FIRE_THRESHOLD && gasPpm > GAS_DANGER_THRESHOLD && pulseBpm <= PULSE_MAX_LIMIT) {
+    statusFlag = "FIRE_&_GAS_LEAK";
+    isSystemInDanger = true;
+    routingDirection = "ESCAPE_LEFT"; 
+    lcdLine1 = "FIRE + GAS LEAK!";
+    lcdLine2 = "EVACUATE LEFT <--";
+    blynkAlertMsg = "COMBINED FIRE AND TOXIC GAS DETECTED!";
+  }
+  // PATTERN 3: GAS LEAK WITH WORKER PANIC
+  else if (gasPpm > GAS_DANGER_THRESHOLD && pulseBpm > PULSE_MAX_LIMIT && temperature <= TEMP_FIRE_THRESHOLD) {
+    statusFlag = "GAS_&_PULSE_HIGH";
+    isSystemInDanger = true;
+    routingDirection = "ESCAPE_RIGHT"; 
+    lcdLine1 = "TOXIC GAS EVAC!";
+    lcdLine2 = "EVACUATE RIGHT->";
+    blynkAlertMsg = "GAS LEAK WITH WORKER PANIC!";
+  }
+  // PATTERN 4: FIRE WITH WORKER PANIC
+  else if (temperature > TEMP_FIRE_THRESHOLD && pulseBpm > PULSE_MAX_LIMIT && gasPpm <= GAS_DANGER_THRESHOLD) {
+    statusFlag = "TEMP_&_PULSE_HIGH";
+    isSystemInDanger = true;
+    routingDirection = "ESCAPE_LEFT";
+    lcdLine1 = "THERMAL EVAC!  ";
+    lcdLine2 = "ROUTE TO LEFT  ";
+    blynkAlertMsg = "FIRE WITH WORKER PANIC!";
+  }
+  // PATTERN 5: STANDALONE SILENT GAS LEAK
+  else if (gasPpm > GAS_DANGER_THRESHOLD && temperature <= TEMP_FIRE_THRESHOLD && pulseBpm <= PULSE_MAX_LIMIT) {
+    statusFlag = "TOXIC_LEAK";
+    isSystemInDanger = true;
+    routingDirection = "ESCAPE_RIGHT"; 
+    lcdLine1 = "TOXIC GAS LEAK!";
+    lcdLine2 = "EVACUATE RIGHT->";
+    blynkAlertMsg = "SILENT TOXIC GAS LEAK DETECTED!";
+  }
+  // PATTERN 6: STANDALONE HIGH TEMPERATURE
+  else if (temperature > TEMP_FIRE_THRESHOLD && gasPpm <= GAS_DANGER_THRESHOLD && pulseBpm <= PULSE_MAX_LIMIT) {
+    statusFlag = "HIGH_TEMP";
+    isSystemInDanger = true;
+    routingDirection = "ESCAPE_LEFT";
+    lcdLine1 = "FIRE DETECTED!";
+    lcdLine2 = "ROUTE TO LEFT";
+    blynkAlertMsg = "HIGH TEMPERATURE / FIRE DETECTED!";
+  }
+  // PATTERN 7: CRITICAL FALL DETECTED
+  else if (netAcceleration > FALL_IMPACT_G && pulseBpm < PULSE_MIN_LIMIT) {
+    statusFlag = "WORKER_FALL";
+    isSystemInDanger = true;
+    routingDirection = "STAY_STILL"; 
+    lcdLine1 = "CRITICAL FALL!";
+    lcdLine2 = "MAN DOWN - ALERT";
+    blynkAlertMsg = "CRITICAL WORKER FALL / MAN DOWN!";
+  }
+  // PATTERN 8: FALSE ALARM FILTERING
+  else if (pulseBpm > PULSE_MAX_LIMIT && gasPpm < 200 && temperature < 40.0) {
+    statusFlag = "EXERTION";
+    isSystemInDanger = false;
+    warningFlag = true; 
+  }
+
+  // --- SERIAL MONITOR LOG OUTPUT ---
+  if (isSystemInDanger) {
+    Serial.print("STATUS: EMERGENCY DETECTED | TYPE: ");
+    Serial.println(statusFlag);
+  } else {
+    Serial.println("STATUS: NORMAL CONDITION");
+  }
+
+  // --- LIVE LCD SCREEN DYNAMICS ---
+  unsigned long currentMillis = millis();
+  
+  if (isSystemInDanger) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(lcdLine1);
+    lcd.setCursor(0, 1); lcd.print(lcdLine2);
+  } 
+  else {
+    if (currentMillis - lastLcdUpdateTime >= 2000) {
+      lastLcdUpdateTime = currentMillis;
+      displayToggle = !displayToggle;
+      lcd.clear();
+      
+      if (!displayToggle) {
+        lcd.setCursor(0, 0); lcd.print("T:" + String(temperature, 1) + "C G:" + String(gasPpm));
+      } else {
+        lcd.setCursor(0, 0); lcd.print("P:" + String(pulseBpm) + "bpm S:" + (warningFlag ? "WARN" : "OK"));
+      }
+    }
+  }
+
+  // --- HARDWARE ACTUATORS & SAFE DATA STREAMING ---
+  if (isSystemInDanger) {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, LOW);
+    digitalWrite(RED_LED, HIGH);     
+    
+    tone(BUZZER_PIN, 1000);  
+
+    if (routingDirection == "ESCAPE_LEFT") {
+      leftVibeServo.write(180); rightVibeServo.write(0);
+    } 
+    else if (routingDirection == "ESCAPE_RIGHT") {
+      rightVibeServo.write(180); leftVibeServo.write(0);
+    } 
+    else {
+      leftVibeServo.write(90); rightVibeServo.write(90);
+    }
+
+    // [ANTI-FLOOD LOCK] Stream dashboard data ONLY once every 5 seconds during emergency
+    if (currentMillis - lastBlynkDataTime >= 5000) {
+      lastBlynkDataTime = currentMillis;
+      if (Blynk.connected()) {
+        Blynk.virtualWrite(V1, temperature);
+        Blynk.virtualWrite(V2, gasPpm);
+        Blynk.virtualWrite(V3, pulseBpm);
+        Blynk.virtualWrite(V4, statusFlag);
+      }
+    }
+
+    // --- INSTANT + 1 MINUTE PUSH NOTIFICATION DISPATCHER ---
+    unsigned long timeCheck = millis();
+    
+    if (!wasInDangerBefore || (timeCheck - lastNotificationTime >= notificationInterval)) {
+      if (Blynk.connected()) {
+        // Direct critical push trigger to server pointer
+        Blynk.logEvent("emergency_alert", blynkAlertMsg);
+        Serial.println(">>> [SUCCESS] BLYNK PUSH NOTIFICATION DISPATCHED SAFELY!");
+      }
+      lastNotificationTime = timeCheck;
+      wasInDangerBefore = true; 
+    }
+  } 
+  else {
+    digitalWrite(GREEN_LED, warningFlag ? LOW : HIGH);
+    digitalWrite(YELLOW_LED, warningFlag ? HIGH : LOW); 
+    digitalWrite(RED_LED, LOW);
+    noTone(BUZZER_PIN); 
+    
+    leftVibeServo.write(0); rightVibeServo.write(0);
+    wasInDangerBefore = false; 
+    lastNotificationTime = 0;
+
+    // [ANTI-FLOOD LOCK] Stream standard parameters once every 5 seconds
+    if (currentMillis - lastBlynkDataTime >= 5000) {
+      lastBlynkDataTime = currentMillis;
+      if (Blynk.connected()) {
+        Blynk.virtualWrite(V1, temperature);
+        Blynk.virtualWrite(V2, gasPpm);
+        Blynk.virtualWrite(V3, pulseBpm);
+        Blynk.virtualWrite(V4, warningFlag ? "WORKER_EXERTION" : "SYSTEM_SAFE");
+      }
+    }
+  }
+}
